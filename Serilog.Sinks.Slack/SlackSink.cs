@@ -28,7 +28,7 @@ namespace Serilog.Sinks.Slack
         };
 
         private readonly SlackSinkOptions _options;
-        private readonly ITextFormatter _textFormatter;
+        private readonly SlackMessageFormatter _textFormatter;
         private readonly PeriodicBatchingSink _periodicBatchingSink;
         private bool _disposed = false;
 
@@ -46,9 +46,11 @@ namespace Serilog.Sinks.Slack
         /// <param name="textFormatter">Formatter used to convert log events to text.</param>
         public SlackSink(SlackSinkOptions options, ITextFormatter textFormatter)
         {
-            _options = options;
-            _textFormatter = textFormatter;
-            _periodicBatchingSink = new PeriodicBatchingSink(this, options.ToPeriodicBatchingSinkOptions());
+			_textFormatter = new SlackMessageFormatter(options, textFormatter);
+			var client = new SlackClient();
+			var batchingSink = new SlackBatchingSink(_textFormatter, client, options);
+
+			_periodicBatchingSink = new PeriodicBatchingSink(batchingSink, options.ToPeriodicBatchingSinkOptions());
         }
 
         /// <summary>
@@ -70,7 +72,7 @@ namespace Serilog.Sinks.Slack
             foreach (var logEvent in events)
             {
                 if (logEvent.Level < _options.MinimumLogEventLevel) continue;
-                var message = CreateMessage(logEvent);
+                var message = _textFormatter.CreateMessage(logEvent);
                 var json = JsonConvert.SerializeObject(message, _jsonSerializerSettings);
                 await _client.PostAsync(_options.WebHookUrl, new StringContent(json));
             }
@@ -87,160 +89,8 @@ namespace Serilog.Sinks.Slack
 
         public void Dispose()
         {
-            Dispose(true);
-            GC.SuppressFinalize(this);
-        }
-
-        protected virtual void Dispose(bool disposing)
-        {
-            if (_disposed)
-            {
-                return;
-            }
-
-            if (disposing)
-            {
-                _periodicBatchingSink.Dispose();
-                _client.Dispose();
-            }
-
-            _disposed = true;
-        }
-
-        protected Message CreateMessage(LogEvent logEvent)
-        {
-            using (var textWriter = new StringWriter())
-            {
-                _textFormatter.Format(logEvent, textWriter);
-
-                return new Message
-                {
-                    Text = textWriter.ToString(),
-                    Channel = GetPropertyFromLogEvent(logEvent, OverridableProperties.CustomChannel, _options.CustomChannel),
-                    UserName = GetPropertyFromLogEvent(logEvent, OverridableProperties.CustomUserName, _options.CustomUserName),
-                    IconEmoji = GetPropertyFromLogEvent(logEvent, OverridableProperties.CustomIcon, _options.CustomIcon),
-                    Attachments = CreateAttachments(logEvent).ToList()
-                };
-            }
-        }
-
-        protected IEnumerable<Attachment> CreateAttachments(LogEvent logEvent)
-        {
-            // If default attachments are enabled.
-            if (_options.ShowDefaultAttachments)
-            {
-                var attachment = new Attachment
-                {
-                    Fallback = $"[{logEvent.Level}]{logEvent.RenderMessage()}",
-                    Color = _options.AttachmentColors[logEvent.Level],
-                    Fields = new List<Field>()
-                };
-
-                AddAttachmentField(ref attachment, new Field { Title = "Level", Value = logEvent.Level.ToString(), Short = _options.DefaultAttachmentsShortFormat });
-                AddAttachmentField(ref attachment, new Field { Title = "Timestamp", Value = logEvent.Timestamp.ToString(_options.TimestampFormat), Short = _options.DefaultAttachmentsShortFormat });
-
-                if (attachment.Fields.Any())
-                    yield return attachment;
-            }
-
-            if (_options.ShowPropertyAttachments)
-            {
-                var fields = new List<Field>();
-
-                using (var stringWriter = new StringWriter())
-                {
-                    foreach (KeyValuePair<string, LogEventPropertyValue> property in logEvent.Properties)
-                    {
-                        if (_options.PropertyOverrideList?.Any(x => Enum.GetName(typeof(OverridableProperties), x).Equals(property.Key, StringComparison.OrdinalIgnoreCase)) ?? false)
-                            continue;
-                        else if (!_options.PropertyAllowList?.Any(x => x.Equals(property.Key, StringComparison.OrdinalIgnoreCase)) ?? false)
-                            continue;
-                        else if (_options.PropertyDenyList?.Any(x => x.Equals(property.Key, StringComparison.OrdinalIgnoreCase)) ?? false)
-                            continue;
-
-                        property.Value.Render(stringWriter);
-                        var field = new Field
-                        {
-                            Title = property.Key,
-                            Value = stringWriter.ToString(),
-                            Short = _options.PropertyAttachmentsShortFormat
-                        };
-                        fields.Add(field);
-
-                        stringWriter.GetStringBuilder().Clear();
-                    }
-                }
-
-                if (fields.Any())
-                {
-                    yield return new Attachment
-                    {
-                        Fallback = $"[{logEvent.Level}]{logEvent.RenderMessage()}",
-                        Color = _options.AttachmentColors[logEvent.Level],
-                        Fields = fields
-                    };
-                }
-            }
-
-            // If there is an exception in the current event,
-            // and exception attachments are enabled.
-            if (logEvent.Exception != null && _options.ShowExceptionAttachments)
-            {
-                var attachment = new Attachment
-                {
-                    Title = "Exception",
-                    Fallback = $"Exception: {logEvent.Exception.Message} \n {ShortenMessage(logEvent.Exception.StackTrace, 1000)}",
-                    Color = _options.AttachmentColors[LogEventLevel.Fatal],
-                    Fields = new List<Field>(),
-                    MrkdwnIn = new List<string> { "fields" }
-                };
-
-                AddAttachmentField(ref attachment, new Field { Title = "Message", Value = logEvent.Exception.Message });
-                AddAttachmentField(ref attachment, new Field { Title = "Type", Value = $"`{logEvent.Exception.GetFlattenedType()}`" });
-
-                AddAttachmentField(ref attachment, new Field { Title = "Exception", Value = $"```{ShortenMessage(logEvent.Exception.GetFlattenedMessage(), 1000)}```", Short = false });
-
-                if (!string.IsNullOrEmpty(logEvent.Exception.StackTrace))
-                    AddAttachmentField(ref attachment, new Field { Title = "Stack Trace", Value = $"```{ShortenMessage(logEvent.Exception.GetFlattenedStackTrace(), 1000)}```", Short = false });
-
-                if (attachment.Fields.Any())
-                    yield return attachment;
-            }
-        }
-
-        private void AddAttachmentField(ref Attachment attachment, Field field)
-        {
-            if (!_options.PropertyAllowList?.Any(x => x.Equals(field.Title, StringComparison.OrdinalIgnoreCase)) ?? false)
-                return;
-            else if (_options.PropertyDenyList?.Any(x => x.Equals(field.Title, StringComparison.OrdinalIgnoreCase)) ?? false)
-                return;
-
-            attachment.Fields.Add(field);
-        }
-
-        private string GetPropertyFromLogEvent(LogEvent logEvent, OverridableProperties overridableProperty, string defaultValue)
-        {
-            if (!_options.PropertyOverrideList?.Contains(overridableProperty) ?? true) return defaultValue;
-
-            var overridablePropertyName = Enum.GetName(typeof(OverridableProperties), overridableProperty);
-            if (!logEvent.Properties.TryGetValue(overridablePropertyName, out var value))
-                return defaultValue;
-
-            var stringValue = value is LogEventPropertyValue logEventPropertyValue ? logEventPropertyValue.ToString().Replace("\"", string.Empty) : defaultValue;
-            return !string.IsNullOrEmpty(stringValue)
-                ? stringValue
-                : defaultValue;
-        }
-
-        private static string ShortenMessage(string message, int maxLength)
-        {
-            if (string.IsNullOrEmpty(message))
-                return message;
-
-            if (message.Length < maxLength)
-                return message;
-
-            return message.Substring(0, maxLength - 3) + "...";
-        }
+			_periodicBatchingSink.Dispose();
+		}
+        
     }
 }
